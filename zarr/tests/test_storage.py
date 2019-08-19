@@ -40,7 +40,7 @@ from zarr.storage import (init_array, array_meta_key, attrs_key, DictStore, Memo
                           DirectoryStore, ZipStore, init_group, group_meta_key,
                           getsize, migrate_1to2, TempStore, atexit_rmtree,
                           NestedDirectoryStore, default_compressor, DBMStore,
-                          LMDBStore, SQLiteStore, ABSStore, atexit_rmglob, LRUStoreCache,
+                          LMDBStore, SQLiteStore, ABSStore, atexit_rmglob, LRUStoreCache, SimplekvStore,
                           ConsolidatedMetadataStore, MongoDBStore, RedisStore)
 from zarr.meta import (decode_array_metadata, encode_array_metadata, ZARR_FORMAT,
                        decode_group_metadata, encode_group_metadata)
@@ -1538,6 +1538,18 @@ class TestABSStore(StoreTests, unittest.TestCase):
                          account_key='bar', blob_service_kwargs={'is_emulated': True})
         store.rmdir()
         return store
+
+
+class TestSimpleKVStore(StoreTests, unittest.TestCase):
+
+    def create_store(self):
+        from storefact import get_store_from_url
+        from functools import partial
+
+        path = tempfile.mkdtemp()
+        return SimplekvStore(
+            f"hfs://{path}"
+        )
 
 
 class TestConsolidatedMetadataStore(unittest.TestCase):

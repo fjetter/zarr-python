@@ -10,11 +10,17 @@ import re
 import numpy as np
 from numcodecs.compat import ensure_bytes, ensure_ndarray
 
+from functools import partial
+from kartothek.core.factory import DatasetFactory
 
+from kartothek.io.eager import read_dataset_as_dataframes
+from kartothek.io.eager import update_dataset_from_dataframes
+from kartothek.io.eager import commit_dataset
+import pandas as pd
 from zarr.util import (is_total_slice, human_readable_size, normalize_resize_args,
                        normalize_storage_path, normalize_shape, normalize_chunks,
                        InfoReporter, check_array_shape, nolock)
-from zarr.storage import array_meta_key, attrs_key, listdir, getsize
+from zarr.storage import array_meta_key, attrs_key, listdir, getsize, KARTOTHEK_ARRAY_COL, KARTOTHEK_CHUNK_COL
 from zarr.meta import decode_array_metadata, encode_array_metadata
 from zarr.attrs import Attributes
 from zarr.errors import PermissionError, err_read_only, err_array_not_found
@@ -24,6 +30,9 @@ from zarr.indexing import (OIndex, OrthogonalIndexer, BasicIndexer, VIndex,
                            CoordinateIndexer, MaskIndexer, check_fields, pop_fields,
                            ensure_tuple, is_scalar, is_contiguous_selection,
                            err_too_many_indices, check_no_multi_fields)
+from zarr.storage import SimplekvStoreWrapper
+
+KARTOTHEK_UUID = "zarrkartothek"
 
 
 # noinspection PyUnresolvedReferences
@@ -108,9 +117,13 @@ class Array(object):
         # N.B., expect at this point store is fully initialized with all
         # configuration metadata fully specified and normalized
 
-        self._store = store
+        self._store = SimplekvStoreWrapper(store)
         self._chunk_store = chunk_store
         self._path = normalize_storage_path(path)
+        self.ds_factory = DatasetFactory(
+            KARTOTHEK_UUID,
+            lambda : self._store
+        )
         if self._path:
             self._key_prefix = self._path + '/'
         else:
@@ -122,7 +135,7 @@ class Array(object):
 
         # initialize metadata
         self._load_metadata()
-
+        # TODO: Attributes?
         # initialize attributes
         akey = self._key_prefix + attrs_key
         self._attrs = Attributes(store, key=akey, read_only=read_only,
@@ -145,15 +158,15 @@ class Array(object):
                 self._load_metadata_nosync()
 
     def _load_metadata_nosync(self):
+
         try:
-            mkey = self._key_prefix + array_meta_key
-            meta_bytes = self._store[mkey]
+            meta = self.ds_factory.metadata["zarr_array_meta"]
         except KeyError:
             err_array_not_found(self._path)
         else:
 
             # decode and store metadata as instance members
-            meta = decode_array_metadata(meta_bytes)
+            meta = decode_array_metadata(meta)
             self._meta = meta
             self._shape = meta['shape']
             self._chunks = meta['chunks']
@@ -197,13 +210,19 @@ class Array(object):
         meta = dict(shape=self._shape, chunks=self._chunks, dtype=self._dtype,
                     compressor=compressor_config, fill_value=self._fill_value,
                     order=self._order, filters=filters_config)
-        mkey = self._key_prefix + array_meta_key
-        self._store[mkey] = encode_array_metadata(meta)
+        self.ds_factory._cache_metadata = commit_dataset(
+            dataset_uuid=KARTOTHEK_UUID,
+            store=self._store,
+            new_partitions=[],
+            metadata={
+                "zarr_array_meta": encode_array_metadata(meta)
+            }
+        )
 
     @property
     def store(self):
         """A MutableMapping providing the underlying storage for the array."""
-        return self._store
+        return self._store.original_store
 
     @property
     def path(self):
@@ -379,12 +398,7 @@ class Array(object):
     @property
     def nchunks_initialized(self):
         """The number of chunks that have been initialized with some data."""
-
-        # key pattern for chunk keys
-        prog = re.compile(r'\.'.join([r'\d+'] * min(1, self.ndim)))
-
-        # count chunk keys
-        return sum(1 for k in listdir(self.chunk_store, self._path) if prog.match(k))
+        return len(self.ds_factory.partitions)
 
     # backwards compability
     initialized = nchunks_initialized
@@ -706,18 +720,12 @@ class Array(object):
             err_too_many_indices(selection, ())
 
         try:
-            # obtain encoded data for chunk
-            ckey = self._chunk_key((0,))
-            cdata = self.chunk_store[ckey]
-
+            chunk = self._fetch_chunk_ktk((0,))
         except KeyError:
             # chunk not initialized
             chunk = np.zeros((), dtype=self._dtype)
             if self._fill_value is not None:
                 chunk.fill(self._fill_value)
-
-        else:
-            chunk = self._decode_chunk(cdata)
 
         # handle fields
         if fields:
@@ -1489,8 +1497,15 @@ class Array(object):
             chunk[selection] = value
 
         # encode and store
-        cdata = self._encode_chunk(chunk)
-        self.chunk_store[ckey] = cdata
+        cdata = self._encode_chunk(chunk, (0,))
+        self.ds_factory._cache_metadata = update_dataset_from_dataframes(
+            df_list=[cdata],
+            delete_scope={
+                KARTOTHEK_CHUNK_COL: 0
+            },
+            dataset_uuid=KARTOTHEK_UUID,
+            store=lambda :self._store,
+        )
 
     def _set_basic_selection_nd(self, selection, value, fields=None):
         # implementation of __setitem__ for array with at least one dimension
@@ -1527,10 +1542,16 @@ class Array(object):
             if not hasattr(value, 'shape'):
                 value = np.asanyarray(value)
             check_array_shape('value', value, sel_shape)
-
+        new_chunks = []
         # iterate over chunks in range
+        delete_scope = []
         for chunk_coords, chunk_selection, out_selection in indexer:
-
+            ktk_coord = {}
+            for ix, coord in enumerate(chunk_coords):
+                if self.ndim == 0:
+                    continue
+                ktk_coord[KARTOTHEK_CHUNK_COL + str(ix)] = coord
+            delete_scope.append(ktk_coord)
             # extract data to store
             if sel_shape == ():
                 chunk_value = value
@@ -1547,7 +1568,38 @@ class Array(object):
                     chunk_value = chunk_value[item]
 
             # put data
-            self._chunk_setitem(chunk_coords, chunk_selection, chunk_value, fields=fields)
+            new_chunks.append(
+                self._chunk_setitem(chunk_coords, chunk_selection, chunk_value, fields=fields)
+            )
+
+        self.ds_factory._cache_metadata = update_dataset_from_dataframes(
+            df_list=new_chunks,
+            dataset_uuid=KARTOTHEK_UUID,
+            store=lambda :self._store,
+            delete_scope=delete_scope,
+        )
+
+    def _fetch_chunk_ktk(self, chunk_coords):
+        if self.ndim:
+            predicates = [
+                [
+                    (KARTOTHEK_CHUNK_COL + str(ix), "==", coord)
+                    for ix, coord in enumerate(chunk_coords)
+                ]
+            ]
+        else:
+            predicates = None
+        ktk_chunks = read_dataset_as_dataframes(
+            factory=self.ds_factory,
+            predicates=predicates,
+            columns={"table": [KARTOTHEK_ARRAY_COL]},
+        )
+
+        if len(ktk_chunks) == 0:
+            raise KeyError
+
+        cdata = ktk_chunks[0]['table'][KARTOTHEK_ARRAY_COL].values
+        return cdata.reshape(self.chunks)
 
     def _chunk_getitem(self, chunk_coords, chunk_selection, out, out_selection,
                        drop_axes=None, fields=None):
@@ -1572,13 +1624,11 @@ class Array(object):
 
         assert len(chunk_coords) == len(self._cdata_shape)
 
-        # obtain key for chunk
-        ckey = self._chunk_key(chunk_coords)
-
         try:
-            # obtain compressed data for chunk
-            cdata = self.chunk_store[ckey]
-
+            # TODO: Reading all chunks at once would be much more efficient but some extra care needs to be put in for the uninitialized chunks
+            # The reshaping/flattening hack is also an issue when reading everything
+            # Doing this multiple times introduces an overhead for partition pruning. Maybe not that bad??
+            cdata = self._fetch_chunk_ktk(chunk_coords)
         except KeyError:
             # chunk not initialized
             if self._fill_value is not None:
@@ -1612,7 +1662,7 @@ class Array(object):
                     # into the destination array
 
                     if self._compressor:
-                        self._compressor.decode(cdata, dest)
+                        np.copyto(dest, cdata)
                     else:
                         chunk = ensure_ndarray(cdata).view(self._dtype)
                         chunk = chunk.reshape(self._chunks, order=self._order)
@@ -1620,8 +1670,7 @@ class Array(object):
                     return
 
             # decode chunk
-            chunk = self._decode_chunk(cdata)
-
+            chunk = cdata
             # select data from chunk
             if fields:
                 chunk = chunk[fields]
@@ -1654,14 +1703,13 @@ class Array(object):
             ckey = self._chunk_key(chunk_coords)
             lock = self._synchronizer[ckey]
 
+        # TODO: Lock can be removed?
         with lock:
-            self._chunk_setitem_nosync(chunk_coords, chunk_selection, value,
+            return self._chunk_setitem_nosync(chunk_coords, chunk_selection, value,
                                        fields=fields)
 
     def _chunk_setitem_nosync(self, chunk_coords, chunk_selection, value, fields=None):
-
         # obtain key for chunk storage
-        ckey = self._chunk_key(chunk_coords)
 
         if is_total_slice(chunk_selection, self._chunks) and not fields:
             # totally replace chunk
@@ -1686,30 +1734,22 @@ class Array(object):
         else:
             # partially replace the contents of this chunk
 
-            try:
-
-                # obtain compressed data for chunk
-                cdata = self.chunk_store[ckey]
-
-            except KeyError:
-
-                # chunk not initialized
-                if self._fill_value is not None:
-                    chunk = np.empty(self._chunks, dtype=self._dtype, order=self._order)
-                    chunk.fill(self._fill_value)
-                elif self._dtype == object:
-                    chunk = np.empty(self._chunks, dtype=self._dtype, order=self._order)
-                else:
-                    # N.B., use zeros here so any region beyond the array has consistent
-                    # and compressible data
-                    chunk = np.zeros(self._chunks, dtype=self._dtype, order=self._order)
-
+            if self._fill_value is not None:
+                chunk = np.empty(self._chunks, dtype=self._dtype, order=self._order)
+                chunk.fill(self._fill_value)
+            elif self._dtype == object:
+                chunk = np.empty(self._chunks, dtype=self._dtype, order=self._order)
             else:
+                # N.B., use zeros here so any region beyond the array has consistent
+                # and compressible data
+                chunk = np.zeros(self._chunks, dtype=self._dtype, order=self._order)
 
-                # decode chunk
-                chunk = self._decode_chunk(cdata)
-                if not chunk.flags.writeable:
-                    chunk = chunk.copy(order='K')
+            self._chunk_getitem(
+                chunk_coords, slice(None, None, None), chunk, slice(None, None, None)
+            )
+            # decode chunk
+            if not chunk.flags.writeable:
+                chunk = chunk.copy(order='K')
 
             # modify
             if fields:
@@ -1720,10 +1760,7 @@ class Array(object):
                 chunk[chunk_selection] = value
 
         # encode chunk
-        cdata = self._encode_chunk(chunk)
-
-        # store
-        self.chunk_store[ckey] = cdata
+        return self._encode_chunk(chunk, chunk_coords)
 
     def _chunk_key(self, chunk_coords):
         return self._key_prefix + '.'.join(map(str, chunk_coords))
@@ -1761,28 +1798,14 @@ class Array(object):
 
         return chunk
 
-    def _encode_chunk(self, chunk):
-
-        # apply filters
-        if self._filters:
-            for f in self._filters:
-                chunk = f.encode(chunk)
-
-        # check object encoding
-        if isinstance(chunk, np.ndarray) and chunk.dtype == object:
-            raise RuntimeError('cannot write object array without object codec')
-
-        # compress
-        if self._compressor:
-            cdata = self._compressor.encode(chunk)
-        else:
-            cdata = chunk
-
-        # ensure in-memory data is immutable and easy to compare
-        if isinstance(self.chunk_store, dict):
-            cdata = ensure_bytes(cdata)
-
-        return cdata
+    def _encode_chunk(self, chunk, chunk_coords):
+        cols = {}
+        for ix, coord in enumerate(chunk_coords):
+            if self.ndim == 0:
+                continue
+            cols[KARTOTHEK_CHUNK_COL + str(ix)] = coord
+        cols[KARTOTHEK_ARRAY_COL] = chunk.ravel()
+        return pd.DataFrame(cols)
 
     def __repr__(self):
         t = type(self)
@@ -1898,10 +1921,15 @@ class Array(object):
 
         h = hashlib.new(hashname)
 
-        for i in itertools.product(*[range(s) for s in self.cdata_shape]):
-            h.update(self.chunk_store.get(self._chunk_key(i), b""))
+        # Hashing the list of partitions is probably sufficient and faster
 
-        h.update(self.store.get(self._key_prefix + array_meta_key, b""))
+        h.update("".join(self.ds_factory.partitions.keys()).encode())
+
+        try:
+            meta = self.ds_factory.metadata["zarr_array_meta"].encode()
+        except KeyError:
+            meta = b''
+        h.update(meta)
 
         h.update(self.store.get(self.attrs.key, b""))
 

@@ -33,6 +33,8 @@ import glob
 import warnings
 
 
+import pandas as pd
+from kartothek.io.eager import commit_dataset, create_empty_dataset_header
 from zarr.util import (json_loads, normalize_shape, normalize_chunks, normalize_order,
                        normalize_storage_path, buffer_size,
                        normalize_fill_value, nolock, normalize_dtype)
@@ -51,6 +53,9 @@ __doctest_requires__ = {
     ('LRUStoreCache', 'LRUStoreCache.*'): ['s3fs'],
 }
 
+
+KARTOTHEK_ARRAY_COL = "zarr_array"
+KARTOTHEK_CHUNK_COL = "zarr_chunk"
 
 array_meta_key = '.zarray'
 group_meta_key = '.zgroup'
@@ -317,12 +322,12 @@ def init_array(store, shape, chunks=True, dtype=None, compressor='default',
     as JSON and storing under the '.zarray' key.
 
     """
-
+    store = SimplekvStoreWrapper(store)
     # normalize path
     path = normalize_storage_path(path)
 
-    # ensure parent group initialized
-    _require_parent_group(path, store=store, chunk_store=chunk_store, overwrite=overwrite)
+    # # ensure parent group initialized
+    # _require_parent_group(path, store=store, chunk_store=chunk_store, overwrite=overwrite)
 
     _init_array_metadata(store, shape=shape, chunks=chunks, dtype=dtype,
                          compressor=compressor, fill_value=fill_value,
@@ -330,7 +335,7 @@ def init_array(store, shape, chunks=True, dtype=None, compressor='default',
                          chunk_store=chunk_store, filters=filters,
                          object_codec=object_codec)
 
-
+KARTOTHEK_UUID = "zarrkartothek"
 def _init_array_metadata(store, shape, chunks=None, dtype=None, compressor='default',
                          fill_value=None, order='C', overwrite=False, path=None,
                          chunk_store=None, filters=None, object_codec=None):
@@ -402,8 +407,28 @@ def _init_array_metadata(store, shape, chunks=None, dtype=None, compressor='defa
     meta = dict(shape=shape, chunks=chunks, dtype=dtype,
                 compressor=compressor_config, fill_value=fill_value,
                 order=order, filters=filters_config)
-    key = _path_to_prefix(path) + array_meta_key
-    store[key] = encode_array_metadata(meta)
+    path = path.replace("/", "_")
+    # num_dimensions
+    ndim = len(shape)
+    cols ={}
+    partition_cols = []
+    for ix in range(ndim):
+        c = KARTOTHEK_CHUNK_COL+str(ix)
+        partition_cols.append(c)
+        cols[c] = pd.np.array([], dtype=int)
+    cols[KARTOTHEK_ARRAY_COL] = pd.np.array([], dtype=dtype)
+    ds = create_empty_dataset_header(
+        dataset_uuid=KARTOTHEK_UUID,
+        store=store,
+        table_meta={
+            "table": pd.DataFrame(cols)
+        },
+        metadata={
+            "zarr_array_meta": encode_array_metadata(meta)
+        },
+        partition_on=partition_cols,
+        overwrite=True,
+    )
 
 
 # backwards compatibility
@@ -674,6 +699,72 @@ class DictStore(MemoryStore):
         super(DictStore, self).__init__(*args, **kwargs)
 
 
+class SimplekvStoreWrapper(MutableMapping):
+    def __init__(self, store):
+        self.original_store = store
+
+    def put(self, key, value):
+        self.original_store[key] = value
+
+    # The simplekv API doesn't support the default select
+    def get(self, key, default=None):
+        return self[key]
+
+    def __getitem__(self, key):
+        return self.original_store[key]
+
+    def open(self, key):
+        content = self[key]
+        import io
+        return io.BytesIO(content)
+
+    def __len__(self):
+        return len(self.original_store)
+
+    def __setitem__(self, key, value):
+        return self.put(key, value)
+
+    def __iter__(self):
+        return iter(self.original_store)
+
+    def __delitem__(self, key):
+        del self.original_store[key]
+
+    def iter_keys(self, prefix):
+        return (k for k in iter(self.original_store) if k.startswith(prefix))
+
+
+class SimplekvStore(MutableMapping):
+    def __init__(self, store_url):
+        from storefact import get_store_from_url
+        from functools import partial
+        self.store_factory = partial(
+            get_store_from_url,
+            store_url
+        )
+        self.store = self.store_factory()
+
+    def __getitem__(self, key):
+        try:
+            return self.store.get(key)
+        except (IsADirectoryError, NotADirectoryError):
+            raise KeyError
+
+    def __delitem__(self, key):
+        if key not in self.store:
+            raise KeyError
+        return self.store.delete(key)
+
+    def __len__(self):
+        return len(self.store.keys())
+
+    def __setitem__(self, key, value):
+        self.store.put(key, ensure_bytes(value))
+
+    def __iter__(self):
+        return self.store.iter_keys()
+
+
 class DirectoryStore(MutableMapping):
     """Storage class using directories and files on a standard file system.
 
@@ -745,7 +836,6 @@ class DirectoryStore(MutableMapping):
             raise KeyError(key)
 
     def __setitem__(self, key, value):
-
         # coerce to flat, contiguous array (ideally without copying)
         value = ensure_contiguous_ndarray(value)
 
